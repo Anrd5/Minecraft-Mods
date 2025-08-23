@@ -1,0 +1,1098 @@
+#!/usr/bin/env bash
+#
+# ReInstall Termux Utility — Table UI (Apk | Percentage | Status)
+# - Big ASCII banner, orange-red theme, clean table with in-place updates
+# - Status flow: Downloading → Downloaded → Installing → Installed → Up to Date (monitor)
+# - Main storage: /sdcard/Reinstall (config, logs, apks, rotations)
+# - Root/tsu compatible, retries, update detection, Termux:Boot auto-resume
+# - Built-in APKs + Custom GitHub Release APKs (Add/Toggle/Remove)
+# - File watchers from GitHub raw (json/txt/log) — auto-update
+# - Force: Download only or Download + Install (all built-in + selected custom)
+# - Logs menu: view, follow, export, clear, diagnostics; rotation
+# - Auto-copy self to Android Downloads (reinstall.sh)
+# - Miscellaneous → Session Management (tmux) with named sessions and tmux-at-boot persistence
+#
+# Usage:
+#   chmod +x reinstall.sh
+#   ./reinstall.sh
+#   tsu -c ./reinstall.sh
+#
+set -o nounset
+set -o pipefail
+set +x 2>/dev/null || true
+umask 022
+
+VERSION="2025-08-30-ui8-table+clean-menu-v5-fixes"
+
+# --------- Root/tsu normalization ---------
+ROOT_UID="$(id -u 2>/dev/null || echo 0)"
+RUNNING_AS_ROOT=0; [ "$ROOT_UID" -eq 0 ] && RUNNING_AS_ROOT=1
+
+TERMUX_PREFIX="/data/data/com.termux/files/usr"
+TERMUX_BIN="$TERMUX_PREFIX/bin"
+TERMUX_HOME_DEFAULT="/data/data/com.termux/files/home"
+
+case ":${PATH:-}:" in *":$TERMUX_BIN:"*) ;; *) [ -d "$TERMUX_BIN" ] && export PATH="$TERMUX_BIN:$PATH" || true ;; esac
+if [ "$RUNNING_AS_ROOT" -eq 1 ] && [ -d "$TERMUX_HOME_DEFAULT" ]; then export HOME="$TERMUX_HOME_DEFAULT"; fi
+TMX_HOME="$HOME"
+
+get_home_uid() { stat -c %u "$TMX_HOME" 2>/dev/null || stat -f %u "$TMX_HOME" 2>/dev/null || echo ""; }
+get_home_gid() { stat -c %g "$TMX_HOME" 2>/dev/null || stat -f %g "$TMX_HOME" 2>/dev/null || echo ""; }
+path_is_private() { case "$1" in "$TMX_HOME"/storage|"$TMX_HOME"/storage/*) return 1;; "$TMX_HOME"|"$TMX_HOME"/*) return 0;; *) return 1;; esac; }
+ensure_owner() {
+  [ "$RUNNING_AS_ROOT" -eq 1 ] || return 0
+  command -v chown >/dev/null 2>&1 || return 0
+  local uid gid; uid="$(get_home_uid)"; gid="$(get_home_gid)"
+  [ -n "$uid" ] && [ -n "$gid" ] || return 0
+  for p in "$@"; do [ -e "$p" ] || continue; if path_is_private "$p"; then chown -R "$uid:$gid" "$p" 2>/dev/null || true; fi; done
+}
+run_as_root() {
+  if [ "$RUNNING_AS_ROOT" -eq 1 ]; then /system/bin/sh -c "$*" 2>/dev/null || /bin/sh -c "$*"
+  elif command -v tsu >/dev/null 2>&1; then tsu -c "$*"
+  else return 127; fi
+}
+
+# --------- Main storage (shared) ---------
+ensure_storage_ready() {
+  if [ "$RUNNING_AS_ROOT" -eq 0 ]; then
+    if [ ! -d "$TMX_HOME/storage/shared" ] && command -v termux-setup-storage >/dev/null 2>&1; then
+      termux-setup-storage >/dev/null 2>&1 || true
+      for _ in $(seq 1 20); do [ -d "$TMX_HOME/storage/shared" ] && break; sleep 0.2; done
+    fi
+  fi
+}
+ensure_storage_ready
+get_shared_root() {
+  if   [ -d "$TMX_HOME/storage/shared" ]; then echo "$TMX_HOME/storage/shared"
+  elif [ -n "${EXTERNAL_STORAGE:-}" ] && [ -d "$EXTERNAL_STORAGE" ]; then echo "$EXTERNAL_STORAGE"
+  elif [ -d "/sdcard" ]; then echo "/sdcard"
+  elif [ -d "/storage/emulated/0" ]; then echo "/storage/emulated/0"
+  else echo "$TMX_HOME/storage/shared"; fi
+}
+SHARED_ROOT="$(get_shared_root)"
+MS_DIR="$SHARED_ROOT/Reinstall"; mkdir -p "$MS_DIR" || true
+
+# --------- Paths / config ---------
+APP_DIR="$TMX_HOME/.reinstall"           # private aux state
+META_DIR="$APP_DIR/meta"; mkdir -p "$APP_DIR" "$META_DIR" || true
+CONFIG_FILE="$MS_DIR/config.json"
+CONFIG_TXT="$MS_DIR/selected.txt"
+LOG_FILE="$MS_DIR/reinstall.log"
+LOG_ARCHIVE_DIR="$MS_DIR/logs"
+CUSTOM_APKS_FILE="$MS_DIR/custom_apks.tsv"
+WATCHERS_FILE="$MS_DIR/watchers.tsv"
+APKS_DIR="$MS_DIR/apks"
+TERMUX_BOOT_DIR="$TMX_HOME/.termux/boot"
+BOOT_SCRIPT="$TERMUX_BOOT_DIR/reinstall_check.sh"
+MONITOR_PID="$APP_DIR/monitor.pid"
+MONITOR_INTERVAL_DEFAULT=900
+
+# Downloads + tmux files
+DOWNLOADS_SYMLINK="$TMX_HOME/storage/downloads"
+SESSIONS_FILE="$APP_DIR/sessions.tsv"            # name<TAB>bootflag(0/1)
+BOOT_TMUX_FLAG="$APP_DIR/boot_tmux_enabled"      # file presence => enabled
+BOOT_SESSION_FILE="$APP_DIR/boot_session_name"   # default session name
+
+mkdir -p "$LOG_ARCHIVE_DIR" "$APKS_DIR" || true
+
+# --------- Small helpers ---------
+script_self_path() { local src="${BASH_SOURCE[0]:-$0}"; if command -v realpath >/dev/null 2>&1; then realpath "$src"; elif command -v readlink >/dev/null 2>&1; then readlink -f "$src" 2>/dev/null || echo "$src"; else echo "$src"; fi; }
+trim() { local x="${1:-}"; x="${x#"${x%%[![:space:]]*}"}"; x="${x%"${x##*[![:space:]]}"}"; printf '%s' "$x"; }
+str_sha1() { local s="$1"; if command -v sha1sum >/dev/null 2>&1; then printf '%s' "$s" | sha1sum | awk '{print $1}'; elif command -v openssl >/dev/null 2>&1; then printf '%s' "$s" | openssl sha1 | awk '{print $2}'; else local sum=0 i ch; for ((i=0;i<${#s};i++)); do ch=$(printf '%d' "'${s:i:1}"); sum=$(( (sum + ch) % 1000000007 )); done; printf 's%08d' "$sum"; fi; }
+
+# --------- Logging ---------
+LOG_MAX_BYTES=$((1024*1024))
+log_rotate_if_needed() {
+  [ -f "$LOG_FILE" ] || return 0
+  local sz; sz=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+  [ "$sz" -lt "$LOG_MAX_BYTES" ] && return 0
+  local stamp="$(( $(date +%s) ))" archived="$LOG_ARCHIVE_DIR/reinstall-$stamp.log"
+  mv "$LOG_FILE" "$archived" 2>/dev/null || { cp -f "$LOG_FILE" "$archived" 2>/dev/null || true; : > "$LOG_FILE"; }
+  command -v gzip >/dev/null 2>&1 && gzip -f "$archived" >/dev/null 2>&1 || true
+}
+log()       { mkdir -p "$LOG_ARCHIVE_DIR" || true; log_rotate_if_needed; echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_FILE"; }
+log_error() { mkdir -p "$LOG_ARCHIVE_DIR" || true; log_rotate_if_needed; echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $*" >> "$LOG_FILE"; }
+
+# --------- APK list (built-in) ---------
+declare -a APK_URLS=(
+  "https://github.com/Anrd5/ReInstall/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/ReInstall/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/ReInstall/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/ReInstall/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/ReInstall/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/ReInstall/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/ReInstall/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/ReInstall/releases/download/V1.0/Cryptic.7.apk"
+)
+APK_NAMES=( "Cryptic.0.apk" "Cryptic.1.apk" "Cryptic.2.apk" "Cryptic.3.apk" "Cryptic.4.apk" "Cryptic.5.apk" "Cryptic.6.apk" "Cryptic.7.apk" )
+
+# --------- Colors ---------
+HAS_TTY=0; [ -t 1 ] && HAS_TTY=1
+if [ "$HAS_TTY" -eq 1 ]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+  RED=$'\033[1;31m'; GREEN=$'\033[0;32m'; WHITE=$'\033[1;37m'; GRAY=$'\033[38;5;243m'
+  ORANGE=$'\033[38;5;208m'; ORANGE2=$'\033[38;5;202m'
+else BOLD=''; DIM=''; RESET=''; RED=''; GREEN=''; WHITE=''; GRAY=''; ORANGE=''; ORANGE2=''; fi
+CHECK="✓"; CROSS="✗"; ARROW="➜"
+
+# --------- ALT screen + UI helpers ---------
+FANCY_UI=0
+if [ "$HAS_TTY" -eq 1 ] && command -v tput >/dev/null 2>&1; then
+  if tput cols >/dev/null 2>&1 && tput cup 0 0 >/dev/null 2>&1; then FANCY_UI=1; fi
+fi
+case "${UI_STYLE:-}" in minimal|MINIMAL) FANCY_UI=0;; fancy|FANCY) FANCY_UI=1;; esac
+
+ui_alt_on()  { [ "$HAS_TTY" -eq 1 ] || return 0; (tput smcup 2>/dev/null || printf '\033[?1049h'); printf '\033[2J\033[3J\033[H'; }
+ui_alt_off() { [ "$HAS_TTY" -eq 1 ] || return 0; (tput rmcup 2>/dev/null || printf '\033[?1049l'); }
+ui_cols()    { tput cols 2>/dev/null || echo 80; }
+ui_rows()    { tput lines 2>/dev/null || echo 24; }
+ui_hide()    { [ "$FANCY_UI" -eq 1 ] && tput civis 2>/dev/null || true; }
+ui_show()    { [ "$FANCY_UI" -eq 1 ] && tput cnorm 2>/dev/null || true; }
+ui_goto()    { [ "$FANCY_UI" -eq 1 ] && tput cup "$1" 0 2>/dev/null || true; }
+ui_clear()   { if [ "$FANCY_UI" -eq 1 ] then tput clear 2>/dev/null || printf "\033c"; else printf "\033[2J\033[H"; fi; }
+repeat_char() { local ch="$1" n="$2"; printf "%s" "$(printf "%0.s$ch" $(seq 1 "$n"))"; }
+
+# ANSI stripper for visible width (fixed)
+ansi_strip() { printf "%s" "${1-}" | sed -E 's/\x1B```math
+[0-9;]*[ -/]*[@-~]//g' 2>/dev/null || printf "%s" "${1-}"; }
+
+# Pad/truncate using visible width
+pad_to() {
+  local txt="${1-}" w="${2-0}" plain; plain="$(ansi_strip "$txt")"
+  local len="${#plain}"
+  if [ "$len" -lt "$w" ]; then
+    printf "%s%*s" "$txt" $((w-len)) ""
+  else
+    printf "%s" "${plain:0:$w}"
+  fi
+}
+
+# Inline status tracking
+STATUS_INLINE=0
+ui_status_clear_inline() {
+  if [ "${STATUS_INLINE:-0}" -eq 1 ] && [ "$HAS_TTY" -eq 1 ]; then
+    printf "\r\033[K"; STATUS_INLINE=0
+  fi
+}
+
+# Table layout
+UI_ROW0=0; W_NAME=0; W_PCT=0; W_STATUS=0; TOPBAR_ROW=0; BOTTOM_ROW=0; UI_ROWS_COUNT=0
+BAR_WIDTH=32
+
+banner() {
+  ui_status_clear_inline
+  ui_clear
+  printf "%s" "$ORANGE"
+  cat <<'EOF'
+  ___ ___ ___ _  _ ___ _____ _   _    _    
+ | _ \ __|_ _| \| / __|_   _/_\ | |  | |   
+ |   / _| | || .` \__ \ | |/ _ \| |__| |__ 
+ |_|_\___|___|_|\_|___/ |_/_/ \_\____|____|
+                                           
+EOF
+  printf "%s" "$RESET"
+  printf "%sTermux • tsu-ready • v%s%s\n\n" "$DIM" "$VERSION" "$RESET"
+}
+
+banner_section() {
+  local title="$1"
+  ui_status_clear_inline
+  ui_clear
+  printf "%s════════════════════════════════════════%s\n" "$ORANGE2" "$RESET"
+  printf "%s          %s%s%s\n" "$ORANGE" "$BOLD" "$title" "$RESET"
+  printf "%s════════════════════════════════════════%s\n\n" "$ORANGE2" "$RESET"
+}
+
+box_top()    { local cols; cols=$(ui_cols); printf "┌"; repeat_char "─" $((cols-2)); printf "┐\n"; }
+box_sep()    { local cols; cols=$(ui_cols); printf "├"; repeat_char "─" $((cols-2)); printf "┤\n"; }
+box_bottom() { local cols; cols=$(ui_cols); printf "└"; repeat_char "─" $((cols-2)); printf "┘\n"; }
+
+ui_calc() {
+  local cols; cols=$(ui_cols)
+  local overhead=10     # "│ " + " │ " + " │ " + " │"
+  local status_min=12
+  local name_min=14
+  W_PCT=$((BAR_WIDTH + 6))  # [bar] + " 100%"
+  local inner=$((cols - overhead))
+  if [ $((inner - status_min - name_min)) -lt $((BAR_WIDTH + 6)) ]; then
+    local new_bar=$(( inner - status_min - name_min - 6 ))
+    [ "$new_bar" -lt 6 ] && new_bar=6
+    BAR_WIDTH="$new_bar"
+    W_PCT=$((BAR_WIDTH + 6))
+  fi
+  local rem=$((cols - overhead - W_PCT))
+  if [ "$rem" -lt $((name_min + status_min)) ]; then
+    W_NAME=$name_min
+    W_STATUS=$(( rem - W_NAME )); [ "$W_STATUS" -lt 6 ] && W_STATUS=6
+  else
+    W_STATUS=$status_min
+    W_NAME=$(( rem - W_STATUS ))
+  fi
+  TOPBAR_ROW=9
+  UI_ROW0=$((TOPBAR_ROW + 3))
+}
+
+progress_bar() {
+  local pct="${1:-0}" barw="$BAR_WIDTH"
+  [ "$pct" -gt 100 ] && pct=100; [ "$pct" -lt 0 ] && pct=0
+  local fill=$(( (pct * barw + 50) / 100 )); [ "$fill" -gt "$barw" ] && fill="$barw"
+  local emp=$(( barw - fill ))
+  printf "%s[%s%s]%s %3d%%" "$ORANGE2" "$(printf "%0.s█" $(seq 1 "$fill"))" "$(printf "%0.s·" $(seq 1 "$emp"))" "$RESET" "$pct"
+}
+progress_bar_unknown() {
+  local barw="$BAR_WIDTH" pulse=6
+  [ "$pulse" -gt "$barw" ] && pulse="$barw"
+  local t rem pre post
+  t=$(( ($(date +%s%N 2>/dev/null || date +%s)) % barw ))
+  rem=$(( barw - pulse )); [ "$rem" -le 0 ] && rem=1
+  pre=$(( t % rem )); [ "$pre" -lt 0 ] && pre=0
+  post=$(( barw - pre - pulse )); [ "$post" -lt 0 ] && post=0
+  printf "%s[%s%s%s]%s   --%%" "$ORANGE2" "$(printf "%0.s·" $(seq 1 "$pre"))" "$(printf "%0.s█" $(seq 1 "$pulse"))" "$(printf "%0.s·" $(seq 1 "$post"))" "$RESET"
+}
+
+status_colored() {
+  case "$1" in
+    "Downloading") printf "%sDownloading%s" "$ORANGE2" "$RESET" ;;
+    "Downloaded")  printf "%sDownloaded%s"  "$ORANGE"  "$RESET" ;;
+    "Installing")  printf "%sInstalling%s"  "$ORANGE2" "$RESET" ;;
+    "Installed")   printf "%sInstalled%s"   "$GREEN"   "$RESET" ;;
+    "Up to Date")  printf "%sUp to Date%s"  "$GREEN"   "$RESET" ;;
+    "Failed")      printf "%sFailed%s"      "$RED"     "$RESET" ;;
+    *)             printf "%s" "$1" ;;
+  esac
+}
+
+ui_header() {
+  box_top
+  printf "│ %s%-*s%s │ %s%-*s%s │ %s%-*s%s │\n" \
+    "$BOLD$WHITE" "$W_NAME" "Apk" "$RESET" \
+    "$BOLD$WHITE" "$W_PCT" "Percentage" "$RESET" \
+    "$BOLD$WHITE" "$W_STATUS" "Status" "$RESET"
+  box_sep
+}
+ui_row() {
+  local row="$1" name="$2" pct_text="$3" status_text="$4"
+  local y=$((UI_ROW0 + row))
+  if [ "$FANCY_UI" -eq 1 ]; then
+    ui_goto "$y"; printf "\033[K"
+    printf "│ %s │ %s │ %s │" \
+      "$(pad_to "$name" "$W_NAME")" \
+      "$(pad_to "$pct_text" "$W_PCT")" \
+      "$(pad_to "$status_text" "$W_STATUS")"
+  else
+    printf "│ %s │ %s │ %s │\n" \
+      "$(pad_to "$name" "$W_NAME")" \
+      "$(pad_to "$pct_text" "$W_PCT")" \
+      "$(pad_to "$status_text" "$W_STATUS")"
+  fi
+}
+ui_footer() {
+  local y=$((UI_ROW0 + UI_ROWS_COUNT))
+  if [ "$FANCY_UI" -eq 1 ]; then ui_goto "$y"; fi
+  box_bottom
+  BOTTOM_ROW=$((y+1))
+}
+ui_status_line() {
+  local msg="$1" cols; cols=$(ui_cols)
+  if [ "$FANCY_UI" -eq 1 ]; then
+    ui_goto "$BOTTOM_ROW"; printf "\033[K"; ui_goto "$BOTTOM_ROW"; printf "%s" "$msg"
+  else
+    if [ "$HAS_TTY" -eq 1 ]; then
+      local plain; plain="$(ansi_strip "$msg")"
+      local max=$((cols - 1)); [ "$max" -lt 1 ] && max=1
+      if [ "${#plain}" -gt "$max" ]; then plain="${plain:0:$((max-1))}…"; fi
+      printf "\r\033[K%s" "$plain"; STATUS_INLINE=1
+    else
+      printf "%s\n" "$(ansi_strip "$msg")"
+    fi
+  fi
+}
+
+# --------- HTTP + metadata helpers ---------
+get_remote_headers() {
+  local url="$1" info=""
+  if command -v curl >/dev/null 2>&1; then info=$(curl -fsSIL --retry 2 --connect-timeout 5 --max-time 15 "$url" 2>/dev/null || echo "")
+  elif command -v wget >/dev/null 2>&1; then info=$(wget --spider -S --timeout=15 --tries=2 "$url" 2>&1 || echo "")
+  else info=""; fi
+  echo "$info"
+}
+parse_header() { local headers="$1" hdr="$2"; echo "$headers" | awk -v h="$hdr" 'BEGIN{IGNORECASE=1; if (substr(h,length(h),1) != ":") h=h ":"} {line=$0; l=tolower(line); hh=tolower(h); if (index(l,hh)==1){idx=index(line, ":"); if (idx>0){val=substr(line, idx+1); gsub(/\r/,"",val); gsub(/^[ \t]+|[ \t]+$/,"",val); print val}}}' | tail -n1; }
+get_local_size() { local f="$1"; if [ -f "$f" ]; then stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0; else echo 0; fi; }
+get_file_hash() { local f="$1"; if [ -f "$f" ]; then if command -v sha256sum >/dev/null 2>&1; then sha256sum "$f" | awk '{print $1}'; elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$f" | awk '{print $2}'; else echo "unavailable"; fi else echo "missing"; fi; }
+meta_file() { echo "$META_DIR/${1}.meta"; }
+meta_get() { local entry="$1" key="$2" file; file=$(meta_file "$entry"); [ -f "$file" ] || { echo ""; return 0; }; grep -E "^${key}=" "$file" 2>/dev/null | head -n1 | cut -d'=' -f2- || echo ""; }
+meta_put() {
+  local entry="$1" key="$2" value="$3" file; file=$(meta_file "$entry")
+  mkdir -p "$META_DIR"; touch "$file"
+  if grep -qE "^${key}=" "$file"; then
+    sed -i "s|^${key}=.*|${key}=${value}|" "$file" 2>/dev/null || {
+      local tmp; tmp=$(mktemp 2>/dev/null || echo "$file.tmp")
+      sed "s|^${key}=.*|${key}=${value}|" "$file" > "$tmp" && mv "$tmp" "$file"
+    }
+  else printf "%s=%s\n" "$key" "$value" >> "$file"; fi
+}
+
+check_for_update_apk() {
+  local apkname url local_file
+  apkname="${1-}"; url="${2-}"; local_file="$APKS_DIR/${apkname-}"
+  [ -f "$local_file" ] || return 0
+  local headers remote_len remote_etag remote_mod local_len meta_etag meta_mod
+  headers="$(get_remote_headers "$url")"; [ -z "$headers" ] && return 1
+  remote_len="$(parse_header "$headers" "Content-Length")"
+  remote_etag="$(parse_header "$headers" "ETag")"
+  remote_mod="$(parse_header "$headers" "Last-Modified")"
+  local_len="$(get_local_size "$local_file")"
+  meta_etag="$(meta_get "$apkname" "etag")"
+  meta_mod="$(meta_get "$apkname" "last_modified")"
+  if [ -n "${remote_len:-}" ] && [ "$remote_len" != "$local_len" ]; then return 0; fi
+  if [ -n "${remote_etag:-}" ] && [ "$remote_etag" != "${meta_etag:-}" ]; then return 0; fi
+  if [ -n "${remote_mod:-}" ] && [ "$remote_mod" != "${meta_mod:-}" ]; then return 0; fi
+  return 1
+}
+save_fresh_metadata_generic() {
+  local meta_key="${1-}" url="${2-}" local_file="${3-}"
+  local headers len etag lmod hash; headers="$(get_remote_headers "$url")"
+  len="$(parse_header "$headers" "Content-Length")"; etag="$(parse_header "$headers" "ETag")"; lmod="$(parse_header "$headers" "Last-Modified")"
+  hash="$(get_file_hash "$local_file")"
+  [ -n "$len" ] || len="$(get_local_size "$local_file")"
+  meta_put "$meta_key" "size" "$len"; [ -n "$etag" ] && meta_put "$meta_key" "etag" "$etag" || true
+  [ -n "$lmod" ] && meta_put "$meta_key" "last_modified" "$lmod" || true
+  meta_put "$meta_key" "sha256" "$hash"; meta_put "$meta_key" "checked_at" "$(date -Iseconds)"
+}
+
+# --------- Downloader (updates one row in the table) ---------
+download_into_row() {
+  local row="$1" label="$2" url="$3" out="$4"
+  local tmp="$out.part" headers remote_len dl_pid status
+  headers="$(get_remote_headers "$url")"
+  remote_len="$(parse_header "$headers" "Content-Length")"
+  [ -z "$remote_len" ] && remote_len=0
+  ui_row "$row" "$label" "$(progress_bar 0)" "$(status_colored "Downloading")"
+  local attempt=1 max_attempts=3
+  while [ "$attempt" -le "$max_attempts" ]; do
+    if command -v curl >/dev/null 2>&1; then
+      if [ -f "$tmp" ]; then curl -fsSL --retry 2 --connect-timeout 5 --max-time 0 -C - -o "$tmp" "$url" >/dev/null 2>&1 &
+      else curl -fsSL --retry 2 --connect-timeout 5 --max-time 0 -o "$tmp" "$url" >/dev/null 2>&1 & fi
+    elif command -v wget >/dev/null 2>&1; then
+      if [ -f "$tmp" ]; then wget -q --continue -O "$tmp" "$url" >/dev/null 2>&1 &
+      else wget -q -O "$tmp" "$url" >/dev/null 2>&1 & fi
+    else
+      ui_row "$row" "$label" "   --%" "$(status_colored "Failed")"; return 127
+    fi
+    dl_pid=$!
+    if [ "$remote_len" -gt 0 ]; then
+      local pct=0
+      while kill -0 "$dl_pid" 2>/dev/null; do
+        local sz; sz=$(get_local_size "$tmp")
+        if [ "$sz" -gt 0 ]; then pct=$(( sz * 100 / remote_len )); [ "$pct" -gt 100 ] && pct=100; else pct=0; fi
+        ui_row "$row" "$label" "$(progress_bar "$pct")" "$(status_colored "Downloading")"
+        sleep 0.15
+      done
+    else
+      while kill -0 "$dl_pid" 2>/dev/null; do
+        ui_row "$row" "$label" "$(progress_bar_unknown)" "$(status_colored "Downloading")"
+        sleep 0.15
+      done
+    fi
+    wait "$dl_pid"; status=$?
+    if [ $status -eq 0 ]; then
+      mv -f "$tmp" "$out" 2>/dev/null || { cp -f "$tmp" "$out" 2>/dev/null || true; rm -f "$tmp" 2>/dev/null || true; }
+      ui_row "$row" "$label" "$(progress_bar 100)" "$(status_colored "Downloaded")"
+      return 0
+    fi
+    ui_row "$row" "$label" "retry $attempt/$max_attempts" "$(status_colored "Failed")"
+    attempt=$((attempt+1)); sleep 0.7
+  done
+  rm -f "$tmp" 2>/dev/null || true
+  ui_row "$row" "$label" "   --%" "$(status_colored "Failed")"
+  return 1
+}
+
+# --------- Install helpers ---------
+install_apk_root_ways() {
+  local apkfile="$1"
+  if run_as_root "pm install -r --user 0 \"$apkfile\" >/dev/null 2>&1"; then return 0; fi
+  if run_as_root "pm install -r \"$apkfile\" >/dev/null 2>&1"; then return 0; fi
+  if run_as_root "cmd package install -r \"$apkfile\" >/dev/null 2>&1"; then return 0; fi
+  if run_as_root "/system/bin/sh -c 'pm install -r \"$apkfile\"' >/dev/null 2>&1"; then return 0; fi
+  return 1
+}
+install_apk_interactive() {
+  local apkfile="$1"
+  if command -v termux-open >/dev/null 2>&1; then termux-open "$apkfile" >/dev/null 2>&1 && return 0; fi
+  if command -v am >/dev/null 2>&1; then am start -a android.intent.action.VIEW -d "file://$apkfile" -t "application/vnd.android.package-archive" >/dev/null 2>&1 && return 0; fi
+  return 1
+}
+install_row() {
+  local row="$1" label="$2" file="$3"
+  ui_row "$row" "$label" "$(progress_bar 100)" "$(status_colored "Installing")"
+  if install_apk_root_ways "$file"; then
+    ui_row "$row" "$label" "$(progress_bar 100)" "$(status_colored "Installed")"; echo "root_ok"; return 0
+  fi
+  if install_apk_interactive "$file"; then
+    ui_row "$row" "$label" "$(progress_bar 100)" "$(status_colored "Installing")"; echo "interactive"; return 2
+  fi
+  ui_row "$row" "$label" "$(progress_bar 100)" "$(status_colored "Failed")"; echo "failed"; return 1
+}
+
+# --------- Publish / Downloads ---------
+get_downloads_dir() {
+  if   [ -d "$DOWNLOADS_SYMLINK" ]; then echo "$DOWNLOADS_SYMLINK"
+  elif [ -d "$SHARED_ROOT/Download" ];  then echo "$SHARED_ROOT/Download"
+  elif [ -d "$SHARED_ROOT/Downloads" ]; then echo "$SHARED_ROOT/Downloads"
+  else echo ""; fi
+}
+publish_to_downloads_root() {
+  local src="$1" dlroot; dlroot="$(get_downloads_dir)"
+  [ -f "$src" ] || return 0
+  [ -n "$dlroot" ] || return 0
+  local base dest; base="$(basename "$src")"; dest="$dlroot/$base"
+  if [ "$src" != "$dest" ]; then cp -f "$src" "$dest" 2>/dev/null || true; fi
+  command -v termux-media-scan >/dev/null 2>&1 && termux-media-scan "$dest" >/dev/null 2>&1 || true
+  command -v am >/dev/null 2>&1 && am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d "file://$dest" >/dev/null 2>&1 || true
+  log "Published to Downloads: $dest"
+}
+install_self_into_downloads() {
+  ensure_storage_ready
+  local d; d="$(get_downloads_dir)"
+  [ -n "$d" ] || { log "Downloads dir not available; skipping self install."; return 0; }
+  mkdir -p "$d" 2>/dev/null || true
+  local self dest; self="$(script_self_path)"; dest="$d/reinstall.sh"
+  if command -v cmp >/dev/null 2>&1 && [ -f "$dest" ] && cmp -s "$self" "$dest" 2>/dev/null; then
+    log "Self already up to date in Downloads: $dest"; return 0
+  fi
+  cp -f "$self" "$dest" 2>/dev/null || cat "$self" > "$dest"
+  chmod 0755 "$dest" 2>/dev/null || true
+  command -v termux-media-scan >/dev/null 2>&1 && termux-media-scan "$dest" >/dev/null 2>&1 || true
+  command -v am >/dev/null 2>&1 && am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d "file://$dest" >/dev/null 2>&1 || true
+  log "Installed self to Downloads: $dest"
+}
+
+# --------- Config read/write ---------
+write_config() {
+  local -n sel_indices=$1
+  mkdir -p "$MS_DIR" || true
+  { echo "{ \"selected\": ["; local first=1; for i in "${sel_indices[@]}"; do if [ $first -eq 1 ]; then printf '  %d' "$i"; first=0; else printf ', %d' "$i"; fi; done; echo ""; echo "]}" ; } > "$CONFIG_FILE"
+  : > "$CONFIG_TXT"; for i in "${sel_indices[@]}"; do printf '%s\n' "$i" >> "$CONFIG_TXT"; done
+}
+read_config() {
+  if [ -f "$CONFIG_TXT" ]; then local out=() line; while IFS= read -r line; do case "$line" in ''|*[!0-9]* ) ;; * ) out+=("$line");; esac; done < "$CONFIG_TXT"; [ "${#out[@]}" -gt 0 ] && { echo "${out[@]}"; return; }; fi
+  if [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then mapfile -t arr < <(jq -r '.selected[]?' "$CONFIG_FILE" 2>/dev/null || true); [ "${#arr[@]}" -gt 0 ] && { echo "${arr[@]}"; return; }; fi
+  echo ""
+}
+
+# --------- Named tmux sessions (config + helpers) ---------
+sessions_ensure_file() { [ -f "$SESSIONS_FILE" ] || : > "$SESSIONS_FILE"; }
+sessions_list() { sessions_ensure_file; cat "$SESSIONS_FILE" 2>/dev/null; }
+session_cfg_get_flag() { local name="$1"; awk -F'\t' -v n="$name" 'BEGIN{IGNORECASE=0} $1==n {print ($2==""?"0":$2); exit}' "$SESSIONS_FILE" 2>/dev/null || echo "0"; }
+session_cfg_set() {
+  local name="$1" flag="${2:-0}" tmp; sessions_ensure_file
+  tmp="$(mktemp 2>/dev/null || echo "$SESSIONS_FILE.tmp")"
+  awk -F'\t' -v n="$name" -v f="$flag" 'BEGIN{OFS="\t";found=0} {if($1==n){$2=f; print; found=1} else print} END{if(!found) print n,f}' "$SESSIONS_FILE" > "$tmp"
+  mv "$tmp" "$SESSIONS_FILE"
+}
+session_cfg_remove() { local name="$1" tmp; sessions_ensure_file; tmp="$(mktemp 2>/dev/null || echo "$SESSIONS_FILE.tmp")"; awk -v n="$name" -F'\t' '$1!=n{print}' "$SESSIONS_FILE" > "$tmp"; mv "$tmp" "$SESSIONS_FILE"; }
+boot_tmux_enabled() { [ -f "$BOOT_TMUX_FLAG" ]; }
+boot_tmux_toggle() { if boot_tmux_enabled; then rm -f "$BOOT_TMUX_FLAG" 2>/dev/null || true; else : > "$BOOT_TMUX_FLAG"; fi; }
+boot_session_get() { [ -s "$BOOT_SESSION_FILE" ] && head -n1 "$BOOT_SESSION_FILE" 2>/dev/null || echo "reinstall"; }
+boot_session_set() { local name="$1"; echo "$name" > "$BOOT_SESSION_FILE"; }
+
+# tmux helpers
+tmux_ok() { command -v tmux >/dev/null 2>&1; }
+tmux_session_exists() { tmux has-session -t "$1" 2>/dev/null; }
+get_tmux_cmd() { printf '%s --monitor --interval %d --no-prompt --replace' "$APP_DIR/reinstall.sh" "$MONITOR_INTERVAL_DEFAULT"; }
+tmux_start() { local name="$1" cmd; shift; cmd="$*"; tmux new-session -ds "$name" "$cmd" >/dev/null 2>&1; }
+tmux_kill() { tmux kill-session -t "$1" >/dev/null 2>&1 || true; }
+tmux_attach() { tmux attach -t "$1"; }
+tmux_restart() { local name="$1" cmd; cmd="$(get_tmux_cmd)"; tmux_kill "$name"; tmux_start "$name" "$cmd"; }
+tmux_list_sessions() { tmux list-sessions 2>/dev/null | awk -F: '{print $1}'; }
+
+# --------- Custom APKs ---------
+ensure_custom_file() { [ -f "$CUSTOM_APKS_FILE" ] || { : > "$CUSTOM_APKS_FILE"; }; }
+custom_apks_selected_lines() { ensure_custom_file; awk -F'\t' 'NF>=3 && $3=="1"{print}' "$CUSTOM_APKS_FILE" 2>/dev/null || true; }
+custom_apks_add() { ensure_custom_file; local apkname_in url sel apkname_val; apkname_in="$(trim "${1-}")"; url="$(trim "${2-}")"; sel="${3:-1}"; apkname_val="$apkname_in"; [ -z "$apkname_val" ] && apkname_val="$(basename "$url" 2>/dev/null || echo "custom.apk")"; printf "%s\t%s\t%s\n" "$apkname_val" "$url" "$sel" >> "$CUSTOM_APKS_FILE"; }
+custom_apks_toggle() { ensure_custom_file; local line="$1" tmp; tmp=$(mktemp 2>/dev/null || echo "$CUSTOM_APKS_FILE.tmp"); awk -v ln="$line" -F'\t' 'BEGIN{OFS="\t"} NR==ln && NF>=3 { $3=($3=="1"?"0":"1"); print; next } {print}' "$CUSTOM_APKS_FILE" > "$tmp"; mv "$tmp" "$CUSTOM_APKS_FILE"; }
+custom_apks_remove() { local line="$1" tmp; tmp=$(mktemp 2>/dev/null || echo "$CUSTOM_APKS_FILE.tmp"); awk -v ln="$line" 'NR!=ln{print}' "$CUSTOM_APKS_FILE" > "$tmp"; mv "$tmp" "$CUSTOM_APKS_FILE"; }
+build_github_release_url() { printf "https://github.com/%s/%s/releases/download/%s/%s" "$1" "$2" "$3" "$4"; }
+
+# --------- Watchers ---------
+ensure_watchers_file() { [ -f "$WATCHERS_FILE" ] || { : > "$WATCHERS_FILE"; }; }
+watchers_list_all() { ensure_watchers_file; cat "$WATCHERS_FILE" 2>/dev/null || true; }
+watchers_add() { ensure_watchers_file; printf "%s\t%s\t%s\n" "$1" "$2" "${3:-1}" >> "$WATCHERS_FILE"; }
+watchers_toggle() { local line="$1" tmp; tmp=$(mktemp 2>/dev/null || echo "$WATCHERS_FILE.tmp"); awk -v ln="$line" -F'\t' 'BEGIN{OFS="\t"} NR==ln && NF>=3 { $3=($3=="1"?"0":"1"); print; next } {print}' "$WATCHERS_FILE" > "$tmp"; mv "$tmp" "$WATCHERS_FILE"; }
+watchers_remove() { local line="$1" tmp; tmp=$(mktemp 2>/dev/null || echo "$WATCHERS_FILE.tmp"); awk -v ln="$line" 'NR!=ln{print}' "$WATCHERS_FILE" > "$tmp"; mv "$tmp" "$WATCHERS_FILE"; }
+watcher_meta_key() { local h; h=$(str_sha1 "$1|$2"); printf "watch-%s" "$h"; }
+watcher_needs_update() {
+  local tgt="$1" url="$2" meta; meta="$(watcher_meta_key "$tgt" "$url")"
+  local headers remote_len remote_etag remote_mod meta_etag meta_mod
+  headers="$(get_remote_headers "$url")"; [ -z "$headers" ] && return 2
+  remote_len="$(parse_header "$headers" "Content-Length")"
+  remote_etag="$(parse_header "$headers" "ETag")"
+  remote_mod="$(parse_header "$headers" "Last-Modified")"
+  meta_etag="$(meta_get "$meta" "etag")"
+  meta_mod="$(meta_get "$meta" "last_modified")"
+  [ -f "$tgt" ] || return 0
+  if [ -n "${remote_etag:-}" ] && [ "$remote_etag" != "${meta_etag:-}" ]; then return 0; fi
+  if [ -n "${remote_mod:-}" ] && [ "$remote_mod" != "${meta_mod:-}" ]; then return 0; fi
+  if [ -n "${remote_len:-}" ]; then local lsz; lsz="$(get_local_size "$tgt")"; [ "$lsz" -ne "${remote_len:-0}" ] && return 0; fi
+  return 1
+}
+
+# --------- Termux:Boot (auto) ---------
+check_termux_boot() { command -v pm >/dev/null 2>&1 && pm list packages 2>/dev/null | grep -q "com.termux.boot"; }
+ensure_self_installed() {
+  local self; self="$(script_self_path)"; local target="$APP_DIR/reinstall.sh"
+  mkdir -p "$APP_DIR"
+  if [ "$self" != "$target" ]; then cp -f "$self" "$target" 2>/dev/null || cat "$self" > "$target"; fi
+  chmod +x "$target" 2>/dev/null || true
+  ensure_owner "$target"
+  [ -f "$BOOT_TMUX_FLAG" ] || : > "$BOOT_TMUX_FLAG"
+  [ -s "$BOOT_SESSION_FILE" ] || echo "reinstall" > "$BOOT_SESSION_FILE"
+}
+auto_setup_termux_boot() {
+  check_termux_boot || return 0
+  mkdir -p "$TERMUX_BOOT_DIR" || true
+  cat > "$BOOT_SCRIPT" << 'BOOT_EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+# BOOT_V3: ensure named tmux session at boot (if enabled), else nohup fallback
+export HOME=/data/data/com.termux/files/home
+export PATH=/data/data/com.termux/files/usr/bin:$PATH
+sleep 10
+if   [ -d "$HOME/storage/shared" ]; then SHARED_ROOT="$HOME/storage/shared"
+elif [ -n "$EXTERNAL_STORAGE" ] && [ -d "$EXTERNAL_STORAGE" ]; then SHARED_ROOT="$EXTERNAL_STORAGE"
+elif [ -d "/sdcard" ]; then SHARED_ROOT="/sdcard"
+else SHARED_ROOT="/storage/emulated/0"; fi
+MS_DIR="$SHARED_ROOT/Reinstall"; mkdir -p "$MS_DIR"
+FLAG="$HOME/.reinstall/boot_tmux_enabled"
+BOOT_SESSION_FILE="$HOME/.reinstall/boot_session_name"
+CANDIDATES=("$HOME/.reinstall/reinstall.sh" "$HOME/reinstall.sh")
+RUN_SCRIPT=""
+for s in "${CANDIDATES[@]}"; do [ -x "$s" ] && { RUN_SCRIPT="$s"; break; }; done
+[ -z "$RUN_SCRIPT" ] && exit 0
+SESSION="$( [ -s "$BOOT_SESSION_FILE" ] && head -n1 "$BOOT_SESSION_FILE" || echo reinstall )"
+CMD="$RUN_SCRIPT --monitor --interval 900 --no-prompt --replace"
+log_append() { echo "$(date '+%F %T') - $*" >> "$MS_DIR/boot.log"; }
+if command -v tmux >/dev/null 2>&1 && [ -f "$FLAG" ]; then
+  if command -v tsu >/dev/null 2>&1; then
+    nohup tsu -c "tmux has-session -t \"$SESSION\" 2>/dev/null || tmux new-session -ds \"$SESSION\" \"$CMD\"" >> "$MS_DIR/boot.log" 2>&1 &
+  else
+    nohup sh -c "tmux has-session -t \"$SESSION\" 2>/dev/null || tmux new-session -ds \"$SESSION\" \"$CMD\"" >> "$MS_DIR/boot.log" 2>&1 &
+  fi
+  log_append "tmux boot ensured (session=$SESSION)"
+else
+  if command -v tsu >/dev/null 2>&1; then
+    nohup tsu -c "$CMD" >> "$MS_DIR/boot.log" 2>&1 &
+  else
+    nohup $CMD >> "$MS_DIR/boot.log" 2>&1 &
+  fi
+  log_append "nohup boot run"
+fi
+disown
+exit 0
+BOOT_EOF
+  chmod +x "$BOOT_SCRIPT" 2>/dev/null || true
+}
+
+# --------- Selection UI ---------
+setup_reinstall() {
+  ui_hide
+  banner_section "SETUP APK SELECTION"
+  printf "%s%sAvailable APKs:%s\n\n" "$BOLD" "$WHITE" "$RESET"
+  for idx in "${!APK_URLS[@]}"; do n=$((idx+1)); printf "  %s[%d]%s %s%s%s\n" "$ORANGE" "$n" "$RESET" "$WHITE" "${APK_NAMES[$idx]}" "$RESET"; done
+  printf "\n%s────────────────────────────────────────%s\n" "$GRAY" "$RESET"
+  printf "\n%sEnter numbers/ranges (e.g. 1-3 5 7)\nType 'all' for all APKs or '0' for none%s\n\n" "$DIM" "$RESET"
+  printf "%s%s Selection:%s " "$ORANGE" "$ARROW" "$RESET"; read -r selection_line
+  parse_tokens_to_indices() {
+    local line="$1" max="${#APK_URLS[@]}" out=() token a b j; declare -A seen=()
+    if [[ "$line" =~ ^[Aa][Ll][Ll]$ ]]; then for i in $(seq 1 "$max"); do out+=("$((i-1))"); done
+    else for token in $line; do
+      if [[ "$token" =~ ^[0-9]+-[0-9]+$ ]]; then a=${token%-*}; b=${token#*-}; [ "$a" -gt "$b" ] && { local t="$a"; a="$b"; b="$t"; }; [ "$a" -lt 1 ] && a=1; [ "$b" -gt "$max" ] && b="$max"; for j in $(seq "$a" "$b"); do [ -z "${seen[$j]:-}" ] && { out+=("$((j-1))"); seen[$j]=1; }; done
+      elif [[ "$token" =~ ^[0-9]+$ ]]; then [ "$token" -eq 0 ] && { out=(); break; }; if [ "$token" -ge 1 ] && [ "$token" -le "$max" ]; then [ -z "${seen[$token]:-}" ] && { out+=("$((token-1))"); seen[$token]=1; }; fi
+      fi
+    done; fi
+    echo "${out[@]}"
+  }
+  IFS=' ' read -r -a chosen <<< "$(parse_tokens_to_indices "$selection_line")"
+  write_config chosen
+  echo; printf "%s%s✓ Configuration saved%s\n" "$GREEN" "$BOLD" "$RESET"
+  printf "%sSelected: %d APKs%s\n" "$DIM" "${#chosen[@]}" "$RESET"
+  printf "%sAPK directory: %s%s\n\n" "$DIM" "$APKS_DIR" "$RESET"
+  read -r -p "Press Enter to continue..." _; ui_show
+}
+
+# --------- Build table rows set ---------
+build_rows() {
+  local action="${1:-install}"
+  IFS=' ' read -r -a sel_builtin <<< "$(read_config)"
+  mapfile -t sel_custom < <(custom_apks_selected_lines || true)
+  mapfile -t watchers_all < <(watchers_list_all || true)
+  row_names=(); row_urls=(); row_outs=(); row_kinds=(); row_actions=(); row_need=()
+  for idx in "${sel_builtin[@]}"; do
+    local name="${APK_NAMES[$idx]:-}" url="${APK_URLS[$idx]:-}"
+    [ -n "$name" ] && [ -n "$url" ] || continue
+    row_names+=("$name"); row_urls+=("$url"); row_outs+=("$APKS_DIR/$name"); row_kinds+=("APK"); row_actions+=("$action")
+    if check_for_update_apk "$name" "$url"; then row_need+=(1); else row_need+=(0); fi
+  done
+  for line in "${sel_custom[@]}"; do
+    [ -z "$line" ] && continue
+    IFS=$'\t' read -r cname curl csel <<< "$line"; [ "${csel:-0}" = "1" ] || continue
+    [ -n "${cname:-}" ] || cname="$(basename "$curl" 2>/dev/null || echo "custom.apk")"
+    row_names+=("$cname"); row_urls+=("$curl"); row_outs+=("$APKS_DIR/$cname"); row_kinds+=("APK"); row_actions+=("$action")
+    if check_for_update_apk "$cname" "$curl"; then row_need+=(1); else row_need+=(0); fi
+  done
+  for wline in "${watchers_all[@]}"; do
+    [ -z "$wline" ] && continue
+    IFS=$'\t' read -r wtgt wurl wen <<< "$wline"; [ "${wen:-0}" = "1" ] || continue
+    row_names+=("$wtgt"); row_urls+=("$wurl"); row_outs+=("$wtgt"); row_kinds+=("FILE"); row_actions+=("write")
+    if watcher_needs_update "$wtgt" "$wurl"; then row_need+=(1); else row_need+=(0); fi
+  done
+}
+
+# --------- Render + process once (table) ---------
+process_table_once() {
+  local action="${1:-install}"
+  build_rows "$action"; UI_ROWS_COUNT=${#row_names[@]}
+  ui_hide; banner; ui_calc; ui_header
+  if [ "$UI_ROWS_COUNT" -eq 0 ]; then
+    printf "│ %s │ %s │ %s │\n" "$(pad_to "(nothing configured)" "$W_NAME")" "$(pad_to "--" "$W_PCT")" "$(pad_to "--" "$W_STATUS")"
+    ui_footer; ui_show; return 0
+  fi
+  local i
+  for i in $(seq 0 $((UI_ROWS_COUNT-1))); do
+    local name="${row_names[$i]}"
+    local pct_txt="   --%"
+    local status_txt="$(status_colored "$([ "${row_need[$i]}" = "1" ] && echo "Downloading" || echo "Up to Date")")"
+    if [ "${row_need[$i]}" = "0" ]; then pct_txt="$(progress_bar 100)"; status_txt="$(status_colored "Up to Date")"; fi
+    ui_row "$i" "$name" "$pct_txt" "$status_txt"
+  done
+  ui_footer
+  local succ=0 fail=0 launched=0
+  for i in $(seq 0 $((UI_ROWS_COUNT-1))); do
+    [ "${row_need[$i]}" = "1" ] || continue
+    local name="${row_names[$i]}" url="${row_urls[$i]}" out="${row_outs[$i]}" kind="${row_kinds[$i]}" act="${row_actions[$i]}"
+    if download_into_row "$i" "$name" "$url" "$out"; then
+      save_fresh_metadata_generic "$(basename "$out")" "$url" "$out"
+      if [ "$kind" = "APK" ] && [ "$act" = "install" ]; then
+        res="$(install_row "$i" "$name" "$out")" || true
+        case "$res" in root_ok) succ=$((succ+1));; interactive) launched=$((launched+1));; *) fail=$((fail+1));; esac
+      else
+        ui_row "$i" "$name" "$(progress_bar 100)" "$(status_colored "Downloaded")"; succ=$((succ+1))
+      fi
+    else
+      ui_row "$i" "$name" "   --%" "$(status_colored "Failed")"; fail=$((fail+1))
+    fi
+  done
+  ui_status_line "$(printf "%sDone.%s Success: %d  Launched: %d  Fail: %d" "$DIM" "$RESET" "$succ" "$launched" "$fail")"
+  ui_show
+}
+
+# --------- Monitor mode (continuous) ---------
+ensure_single_monitor() {
+  local mode="${1:-ask}" # ask|replace|keep
+  if [ -f "$MONITOR_PID" ]; then
+    local oldpid; oldpid="$(cat "$MONITOR_PID" 2>/dev/null || echo "")"
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+      case "$mode" in
+        replace) kill "$oldpid" 2>/dev/null || true; sleep 0.3 ;;
+        keep)    return 2 ;;
+        ask)
+          banner
+          echo "Another monitor is running (PID $oldpid)."
+          read -r -p "Replace it? (Y/n): " ans
+          [[ "$ans" =~ ^[Nn]$ ]] && return 2
+          kill "$oldpid" 2>/dev/null || true; sleep 0.3 ;;
+      esac
+    else rm -f "$MONITOR_PID" 2>/dev/null || true; fi
+  fi
+  echo "$$" > "$MONITOR_PID"; return 0
+}
+monitor_loop() {
+  local interval="${1:-$MONITOR_INTERVAL_DEFAULT}" replace="${2:-ask}"
+  ensure_single_monitor "$replace" || { ui_status_line "Monitor already running; keeping existing."; sleep 1; return 0; }
+  ui_hide
+  local STOP=0
+  trap 'STOP=1' INT TERM
+  while [ "$STOP" -eq 0 ]; do
+    process_table_once "install"
+    log "Cycle complete."
+    local t; for t in $(seq "$interval" -1 1); do
+      [ "$STOP" -ne 0 ] && break
+      ui_status_line "$(printf "%sNext check in %ds — Ctrl+C to stop%s" "$DIM" "$t" "$RESET")"
+      sleep 1
+    done
+  done
+  trap - INT TERM
+  rm -f "$MONITOR_PID" 2>/dev/null || true
+  if [ "${STATUS_INLINE:-0}" -eq 1 ]; then printf "\n"; STATUS_INLINE=0; fi
+  ui_show
+}
+
+start_monitor_from_menu() {
+  banner_section "CONTINUOUS MONITORING"
+  printf "%s• Automatically checks and installs APKs%s\n" "$WHITE" "$RESET"
+  printf "%s• Updates watched configuration files%s\n" "$WHITE" "$RESET"
+  printf "%s• Runs continuously (stop with Ctrl+C)%s\n\n" "$WHITE" "$RESET"
+  printf "%s────────────────────────────────────────%s\n\n" "$GRAY" "$RESET"
+  read -r -p "${ORANGE}${ARROW}${RESET} Start monitoring? (Y/n): " ans
+  [[ "$ans" =~ ^[Nn]$ ]] && return 0
+  monitor_loop "$MONITOR_INTERVAL_DEFAULT" "ask"
+}
+
+# --------- Force actions ---------
+force_prompt_and_run() {
+  banner_section "FORCE DOWNLOAD/REINSTALL"
+  printf "%sSelect action mode:%s\n\n" "$WHITE" "$RESET"
+  printf "  %s1)%s Download + Install\n" "$ORANGE" "$RESET"
+  printf "  %s2)%s Download only %s(default)%s\n\n" "$ORANGE" "$RESET" "$DIM" "$RESET"
+  read -r -p "${ORANGE}${ARROW}${RESET} Mode [1/2]: " m
+  local mode="download"; [ "${m:-2}" = "1" ] && mode="install"
+  process_table_once "$mode"
+}
+
+# --------- Settings ---------
+settings_menu() {
+  banner_section "SETTINGS"
+  printf "%s%sConfiguration:%s\n\n" "$BOLD" "$WHITE" "$RESET"
+  printf "  %sAPK directory:%s %s\n" "$GRAY" "$RESET" "$APKS_DIR"
+  printf "  %sMain storage:%s  %s\n" "$GRAY" "$RESET" "$MS_DIR"
+  printf "  %sLog file:%s      %s\n" "$GRAY" "$RESET" "$LOG_FILE"
+  printf "  %sUI style:%s      %s\n\n" "$GRAY" "$RESET" "$([ "$FANCY_UI" -eq 1 ] && echo "Fancy" || echo "Minimal")"
+  printf "%s────────────────────────────────────────%s\n\n" "$GRAY" "$RESET"
+  printf "  %s1)%s Change APK directory\n" "$ORANGE" "$RESET"
+  printf "  %s2)%s Toggle UI style\n" "$ORANGE" "$RESET"
+  printf "  %s3)%s Install script into Downloads now\n" "$ORANGE" "$RESET"
+  printf "  %sq)%s Back\n\n" "$ORANGE" "$RESET"
+  read -r -p "Choice: " ch
+  case "$ch" in
+    1) read -r -p "  New APK path: " newdir; [ -n "$newdir" ] || return 0; mkdir -p "$newdir" 2>/dev/null || true; if [ -d "$newdir" ]; then APKS_DIR="$newdir"; echo "Set."; else echo "Failed."; fi; read -r -p "Enter..." _ ;;
+    2) if [ "$FANCY_UI" -eq 1 ] then FANCY_UI=0; else FANCY_UI=1; fi; read -r -p "UI toggled. Press Enter..." _ ;;
+    3) install_self_into_downloads; echo "Done."; read -r -p "Press Enter..." _ ;;
+  esac
+}
+
+# --------- Logs menu ---------
+human_size() { local f="$1" s; [ -f "$f" ] || { echo "0B"; return; }; if du -h "$f" >/dev/null 2>&1; then du -h "$f" | awk '{print $1; exit}'; else s=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || wc -c < "$f" 2>/dev/null || echo 0); awk -v b="$s" 'function hum(x){s="BKMGTPE";i=1;while (x>=1024 && i<length(s)){x/=1024;i++} printf("%.1f%s", x, substr(s,i,1));} END{hum(b)}' <<< ""; fi; }
+logs_view_recent() { banner_section "RECENT LOGS"; printf "%sFile: %s  Size: %s%s\n\n" "$DIM" "$LOG_FILE" "$(human_size "$LOG_FILE")" "$RESET"; if [ -s "$LOG_FILE" ]; then tail -n 200 "$LOG_FILE" 2>/dev/null || head -n 200 "$LOG_FILE" || true; else echo "(no log entries yet)"; fi; echo; read -r -p "Press Enter..." _; }
+logs_follow_live() { banner_section "LIVE LOG FOLLOW"; printf "%sFile: %s%s\n\n" "$DIM" "$LOG_FILE" "$RESET"; if command -v less >/dev/null 2>&1; then less +F "$LOG_FILE"; else echo "Following log (Ctrl+C to stop)..."; tail -n 50 -f "$LOG_FILE"; fi; }
+logs_export_downloads() { ensure_storage_ready; if [ ! -s "$LOG_FILE" ] then banner; echo "No log file yet."; echo; read -r -p "Enter..." _; return 0; fi; local tmp base stamp; stamp="$(date '+%Y%m%d-%H%M%S')"; base="reinstall-$stamp.log"; tmp="$APP_DIR/$base"; cp -f "$LOG_FILE" "$tmp" 2>/dev/null || { banner; echo "Copy failed."; read -r -p "Enter..." _; return 1; }; publish_to_downloads_root "$tmp"; banner; echo "Exported to Downloads as: $base"; echo; read -r -p "Enter..." _; }
+logs_clear() { banner; printf "Clear log file? This cannot be undone.\n\n"; read -r -p "Type YES to confirm: " ans; if [ "$ans" = "YES" ]; then : > "$LOG_FILE"; echo "Cleared."; else echo "Aborted."; fi; echo; read -r -p "Enter..." _; }
+logs_collect_diag() {
+  banner_section "SYSTEM DIAGNOSTICS"
+  local stamp out; stamp="$(date '+%Y%m%d-%H%M%S')"; out="$MS_DIR/diag-$stamp.txt"
+  {
+    echo "ReInstall Utility Diagnostics - $stamp"; echo "Version: $VERSION"; echo
+    echo "System:"; uname -a 2>/dev/null || true; getprop ro.build.version.release 2>/dev/null | sed 's/^/Android: /' || true; getprop ro.product.manufacturer 2>/dev/null | sed 's/^/Manufacturer: /' || true; getprop ro.product.model 2>/dev/null | sed 's/^/Model: /' || true
+    echo; echo "Paths:"; echo "HOME=$HOME"; echo "APKS_DIR=$APKS_DIR"; echo "MS_DIR=$MS_DIR"; echo "CONFIG_FILE=$CONFIG_FILE"; echo "LOG_FILE=$LOG_FILE"
+    echo; echo "Binaries:"; for b in tsu pm am curl wget jq sha256sum openssl termux-open termux-media-scan termux-setup-storage less more gzip tmux; do printf "%-20s" "$b:"; command -v "$b" >/dev/null 2>&1 && printf " %s\n" "$(command -v "$b")" || echo " not found"; done
+    echo; echo "Selection / Config:"; echo "- Built-in selected indices: $(read_config 2>/dev/null)"; echo "- Custom APKs (selected=1):"; custom_apks_selected_lines 2>/dev/null || true
+    echo; echo "APK dir listing:"; ls -l "$APKS_DIR" 2>/dev/null || echo "(cannot list $APKS_DIR)"
+    echo; echo "Latest log tail:"; tail -n 200 "$LOG_FILE" 2>/dev/null || echo "(no log)"
+  } > "$out"
+  echo "Saved: $out"; echo; read -r -p "Export to Downloads as well? (y/N): " ex; if [[ "$ex" =~ ^[Yy]$ ]]; then publish_to_downloads_root "$out"; echo "Exported."; fi; echo; read -r -p "Enter..." _; }
+logs_menu() {
+  while true; do
+    banner_section "LOG MANAGEMENT"
+    printf "%sFile:%s %s\n" "$GRAY" "$RESET" "$LOG_FILE"
+    printf "%sSize:%s %s\n\n" "$GRAY" "$RESET" "$(human_size "$LOG_FILE")"
+    printf "%s────────────────────────────────────────%s\n\n" "$GRAY" "$RESET"
+    printf "  %sV)%s View recent logs\n" "$ORANGE" "$RESET"
+    printf "  %sF)%s Follow live\n" "$ORANGE" "$RESET"
+    printf "  %sE)%s Export to Downloads\n" "$ORANGE" "$RESET"
+    printf "  %sC)%s Clear log file\n" "$ORANGE" "$RESET"
+    printf "  %sD)%s System diagnostics\n" "$ORANGE" "$RESET"
+    printf "  %sQ)%s Back\n\n" "$ORANGE" "$RESET"
+    read -r -p "Choice: " ch
+    case "${ch:-}" in V|v) logs_view_recent ;; F|f) logs_follow_live ;; E|e) logs_export_downloads ;; C|c) logs_clear ;; D|d) logs_collect_diag ;; Q|q) break ;; *) echo "Invalid."; read -r -p "Enter..." _ ;; esac
+  done
+}
+
+# --------- Misc → Session Management (named) ---------
+session_management_menu() {
+  while true; do
+    banner_section "SESSION MANAGEMENT (tmux)"
+    local tmux_status="not installed"; tmux_ok && tmux_status="installed"
+    local boot_flag="$(boot_tmux_enabled && echo ON || echo OFF)"
+    local boot_session="$(boot_session_get)"
+    printf "%sStatus:%s tmux: %s, tmux-at-boot: %s, default boot session: %s\n\n" "$BOLD" "$RESET" "$tmux_status" "$boot_flag" "$boot_session"
+    printf "%sConfigured sessions:%s\n" "$BOLD" "$RESET"
+    sessions_ensure_file
+    if [ -s "$SESSIONS_FILE" ]; then
+      local i=0
+      while IFS=$'\t' read -r sname sflag; do
+        [ -z "$sname" ] && continue
+        i=$((i+1))
+        local present="absent"
+        if tmux_ok && tmux_session_exists "$sname"; then present="present"; fi
+        printf "  %s%2d)%s %-16s %s[%s]%s %s%s%s\n" \
+          "$ORANGE" "$i" "$RESET" "$sname" "$DIM" "$([ "${sflag:-0}" = "1" ] && echo "boot=1" || echo "boot=0")" "$RESET" \
+          "$GRAY" "(${present})" "$RESET"
+      done < "$SESSIONS_FILE"
+    else
+      printf "  %s(no sessions configured)%s\n" "$DIM" "$RESET"
+    fi
+    printf "\n%s────────────────────────────────────────%s\n\n" "$GRAY" "$RESET"
+    printf "  %s1)%s Add/ensure session by name\n" "$ORANGE" "$RESET"
+    printf "  %s2)%s Attach to session\n" "$ORANGE" "$RESET"
+    printf "  %s3)%s Restart session\n" "$ORANGE" "$RESET"
+    printf "  %s4)%s Kill session\n" "$ORANGE" "$RESET"
+    printf "  %s5)%s Toggle tmux at boot (now: %s)\n" "$ORANGE" "$RESET" "$boot_flag"
+    printf "  %s6)%s Set default boot session (now: %s)\n" "$ORANGE" "$RESET" "$boot_session"
+    printf "  %s7)%s Remove session from config\n" "$ORANGE" "$RESET"
+    printf "  %s8)%s List active tmux sessions\n" "$ORANGE" "$RESET"
+    if ! tmux_ok; then printf "  %sI)%s Install tmux (pkg install -y tmux)\n" "$ORANGE" "$RESET"; fi
+    printf "  %sQ)%s Back\n\n" "$ORANGE" "$RESET"
+    read -r -p "Choice: " ch
+    case "${ch:-}" in
+      1)
+        read -r -p "  Session name: " name; name="$(trim "$name")"
+        [ -n "$name" ] || { echo "  No name."; read -r -p "Enter..." _; continue; }
+        session_cfg_set "$name" 0
+        if ! tmux_ok; then echo "tmux not installed. Added to config only."; read -r -p "Enter..." _; continue; fi
+        if tmux_session_exists "$name"; then echo "  Session already exists."
+        else
+          cmd="$(get_tmux_cmd)"; tmux_start "$name" "$cmd"; echo "  Session created."
+        fi
+        read -r -p "Enter..." _ ;;
+      2)
+        if ! tmux_ok; then echo "tmux not installed."; read -r -p "Enter..." _; continue; fi
+        read -r -p "  Session to attach: " name; name="$(trim "$name")"
+        [ -n "$name" ] || { echo "  No name."; read -r -p "Enter..." _; continue; }
+        if ! tmux_session_exists "$name"; then echo "  Absent; creating..."; cmd="$(get_tmux_cmd)"; tmux_start "$name" "$cmd"; sleep 0.3; fi
+        tmux_attach "$name" ;;
+      3)
+        if ! tmux_ok; then echo "tmux not installed."; read -r -p "Enter..." _; continue; fi
+        read -r -p "  Session to restart: " name; name="$(trim "$name")"
+        [ -n "$name" ] || { echo "  No name."; read -r -p "Enter..." _; continue; }
+        cmd="$(get_tmux_cmd)"; tmux_restart "$name" "$cmd"; echo "  Restarted."
+        read -r -p "Enter..." _ ;;
+      4)
+        if ! tmux_ok; then echo "tmux not installed."; read -r -p "Enter..." _; continue; fi
+        read -r -p "  Session to kill: " name; name="$(trim "$name")"
+        [ -n "$name" ] || { echo "  No name."; read -r -p "Enter..." _; continue; }
+        tmux_kill "$name"; echo "  Killed."; read -r -p "Enter..." _ ;;
+      5)
+        boot_tmux_toggle; echo "tmux-at-boot is now: $(boot_tmux_enabled && echo ON || echo OFF)"
+        read -r -p "Enter..." _ ;;
+      6)
+        read -r -p "  Default boot session name: " name; name="$(trim "$name")"
+        [ -n "$name" ] || { echo "  No name."; read -r -p "Enter..." _; continue; }
+        session_cfg_set "$name" "$(session_cfg_get_flag "$name")"
+        boot_session_set "$name"; echo "  Default boot session set to: $name"
+        read -r -p "Enter..." _ ;;
+      7)
+        read -r -p "  Session to remove: " name; name="$(trim "$name")"
+        [ -n "$name" ] || { echo "  No name."; read -r -p "Enter..." _; continue; }
+        session_cfg_remove "$name"; echo "  Removed from config."
+        read -r -p "Enter..." _ ;;
+      8)
+        if tmux_ok; then echo "Active tmux sessions:"; tmux_list_sessions || echo "(none)"; else echo "tmux not installed."; fi
+        echo; read -r -p "Enter..." _ ;;
+      I|i)
+        if tmux_ok; then echo "tmux already installed."
+        else
+          if command -v pkg >/dev/null 2>&1; then pkg install -y tmux
+          elif command -v apt >/dev/null 2>&1; then apt update && apt install -y tmux
+          else echo "No package manager found. Install tmux manually."; fi
+        fi
+        read -r -p "Enter..." _ ;;
+      Q|q) break ;;
+      *) echo "Invalid."; read -r -p "Enter..." _ ;;
+    esac
+  done
+}
+misc_menu() {
+  while true; do
+    banner_section "MISCELLANEOUS"
+    printf "%s%sUtilities:%s\n\n" "$BOLD" "$WHITE" "$RESET"
+    printf "  %s1)%s Session Management (tmux, named)\n" "$ORANGE" "$RESET"
+    printf "  %sQ)%s Back\n\n" "$ORANGE" "$RESET"
+    printf "%s────────────────────────────────────────%s\n\n" "$GRAY" "$RESET"
+    read -r -p "Choice: " c
+    case "$c" in 1|"") session_management_menu ;; Q|q) break ;; *) echo "Invalid."; read -r -p "Enter..." _ ;; esac
+  done
+}
+
+# --------- APK Management Section ---------
+apk_menu() {
+  while true; do
+    banner_section "APK MANAGEMENT"
+    printf "%s%sOperations:%s\n\n" "$BOLD" "$WHITE" "$RESET"
+    printf "  %s1)%s Continuous monitoring\n" "$ORANGE" "$RESET"
+    printf "  %s2)%s Setup APK selection\n" "$ORANGE" "$RESET"
+    printf "  %s3)%s Force download/reinstall\n" "$ORANGE" "$RESET"
+    printf "  %s4)%s Manage custom APKs\n" "$ORANGE" "$RESET"
+    printf "  %sq)%s Back to main menu\n\n" "$ORANGE" "$RESET"
+    printf "%s────────────────────────────────────────%s\n\n" "$GRAY" "$RESET"
+    read -r -p "Choice: " c
+    case "$c" in 1|"") start_monitor_from_menu ;; 2) setup_reinstall ;; 3) force_prompt_and_run ;; 4) manage_custom_apks_menu ;; q|Q) break ;; *) echo "Invalid."; read -r -p "Enter..." _ ;; esac
+  done
+}
+manage_custom_apks_menu() {
+  while true; do
+    banner_section "CUSTOM GITHUB APKS"
+    ensure_custom_file
+    if [ -s "$CUSTOM_APKS_FILE" ]; then
+      printf "%s%sConfigured APKs:%s\n\n" "$BOLD" "$WHITE" "$RESET"
+      local i=0
+      while IFS=$'\t' read -r cname curl csel; do
+        [ -z "${cname:-}${curl:-}${csel:-}" ] && continue
+        i=$((i+1))
+        printf "  %s%2d)%s %-36s %s[%s]%s\n      %s%s%s\n" "$ORANGE" "$i" "$RESET" "$cname" "$DIM" "$([ "${csel:-0}" = "1" ] && echo "selected" || echo "off")" "$RESET" "$GRAY" "$curl" "$RESET"
+      done < "$CUSTOM_APKS_FILE"
+    else
+      printf "%s(No custom APKs configured)%s\n" "$DIM" "$RESET"
+    fi
+    printf "\n%s────────────────────────────────────────%s\n\n" "$GRAY" "$RESET"
+    printf "  %sA)%s Add new APK\n" "$ORANGE" "$RESET"
+    printf "  %sT)%s Toggle selection\n" "$ORANGE" "$RESET"
+    printf "  %sR)%s Remove APK\n" "$ORANGE" "$RESET"
+    printf "  %sQ)%s Back\n\n" "$ORANGE" "$RESET"
+    read -r -p "Choice: " ch
+    case "${ch:-}" in
+      A|a)
+        read -r -p "  Full asset URL (blank to build): " full
+        if [ -n "$(trim "$full")" ]; then local nm; nm="$(basename "$full" 2>/dev/null || echo "custom.apk")"; read -r -p "  Name [$nm]: " nm2; nm2="${nm2:-$nm}"; custom_apks_add "$nm2" "$full" 1
+        else read -r -p "  Owner: " owner; read -r -p "  Repo : " repo; read -r -p "  Tag  : " tag; read -r -p "  Asset: " asset; local u; u="$(build_github_release_url "$(trim "$owner")" "$(trim "$repo")" "$(trim "$tag")" "$(trim "$asset")")"; local nm; nm="$(basename "$u" 2>/dev/null || echo "custom.apk")"; custom_apks_add "$nm" "$u" 1; fi;;
+      T|t) read -r -p "  Toggle number: " n; [[ "$n" =~ ^[0-9]+$ ]] && custom_apks_toggle "$n" ;;
+      R|r) read -r -p "  Remove number: " n; [[ "$n" =~ ^[0-9]+$ ]] && custom_apks_remove "$n" ;;
+      Q|q) break ;;
+    esac
+  done
+}
+
+# --------- Script Config Section ---------
+script_config_menu() {
+  while true; do
+    banner_section "SCRIPT CONFIGURATION"
+    printf "%s%sFile Watchers:%s\n\n" "$BOLD" "$WHITE" "$RESET"
+    printf "  %s1)%s Setup file watchers\n" "$ORANGE" "$RESET"
+    printf "  %sq)%s Back to main menu\n\n" "$ORANGE" "$RESET"
+    printf "%s────────────────────────────────────────%s\n\n" "$GRAY" "$RESET"
+    read -r -p "Choice: " c
+    case "$c" in 1|"") setup_watchers_menu ;; q|Q) break ;; *) echo "Invalid."; read -r -p "Enter..." _ ;; esac
+  done
+}
+setup_watchers_menu() {
+  while true; do
+    banner_section "FILE WATCHERS SETUP"
+    ensure_watchers_file
+    if [ -s "$WATCHERS_FILE" ]; then
+      printf "%s%sConfigured Watchers:%s\n\n" "$BOLD" "$WHITE" "$RESET"
+      local i=0
+      while IFS=$'\t' read -r wtgt wurl wen; do
+        [ -z "${wtgt:-}${wurl:-}${wen:-}" ] && continue
+        i=$((i+1))
+        printf "  %s%2d)%s %-40s %s[%s]%s\n      %s%s%s\n" "$ORANGE" "$i" "$RESET" "$wtgt" "$DIM" "$([ "${wen:-0}" = "1" ] && echo "on" || echo "off")" "$RESET" "$GRAY" "$wurl" "$RESET"
+      done < "$WATCHERS_FILE"
+    else
+      printf "%s(No watchers configured)%s\n" "$DIM" "$RESET"
+    fi
+    printf "\n%s────────────────────────────────────────%s\n\n" "$GRAY" "$RESET"
+    printf "  %sA)%s Add watcher\n" "$ORANGE" "$RESET"
+    printf "  %sT)%s Toggle watcher\n" "$ORANGE" "$RESET"
+    printf "  %sR)%s Remove watcher\n" "$ORANGE" "$RESET"
+    printf "  %sQ)%s Back\n\n" "$ORANGE" "$RESET"
+    read -r -p "Choice: " ch
+    case "${ch:-}" in
+      A|a)
+        read -r -p "  Directory: " dir; dir="$(trim "$dir")"; [ -d "$dir" ] || { echo "  Not a dir."; read -r -p "Enter..." _; continue; }
+        echo "  Type: 1=.json  2=.txt  3=.log  4=all"; read -r -p "  Pick: " tsel
+        local pattern; case "$tsel" in 1)pattern="*.json";;2)pattern="*.txt";;3)pattern="*.log";;*)pattern="*.json *.txt *.log";; esac
+        IFS=' ' read -r -a pat_arr <<< "$pattern"
+        mapfile -t files < <( (shopt -s nullglob; for p in "${pat_arr[@]}"; do printf '%s\0' "$dir"/$p; done) | xargs -0 -n1 echo | sort )
+        if [ "${#files[@]}" -gt 0 ]; then local j=0; for f in "${files[@]}"; do j=$((j+1)); printf "  %2d) %s\n" "$j" "$f"; done; fi
+        read -r -p "  Number or full path: " pick
+        local target; if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "${#files[@]}" ]; then target="${files[$((pick-1))]}"; else target="$(trim "$pick")"; fi
+        [ -n "$target" ] || { echo "  No file."; read -r -p "Enter..." _; continue; }
+        [ -f "$target" ] || { mkdir -p "$(dirname "$target")"; : > "$target"; }
+        read -r -p "  GitHub raw URL: " rawurl; rawurl="$(trim "$rawurl")"; [ -n "$rawurl" ] || { echo "  URL required."; read -r -p "Enter..." _; continue; }
+        watchers_add "$target" "$rawurl" 1 ;;
+      T|t) read -r -p "  Toggle number: " n; [[ "$n" =~ ^[0-9]+$ ]] && watchers_toggle "$n" ;;
+      R|r) read -r -p "  Remove number: " n; [[ "$n" =~ ^[0-9]+$ ]] && watchers_remove "$n" ;;
+      Q|q) break ;;
+    esac
+  done
+}
+
+# --------- Main menu ---------
+main_menu() {
+  while true; do
+    banner
+    printf "%s%sMAIN MENU%s\n\n" "$BOLD" "$WHITE" "$RESET"
+    printf "  %s1)%s APK Management\n" "$ORANGE" "$RESET"
+    printf "  %s2)%s Script Configuration\n" "$ORANGE" "$RESET"
+    printf "  %s3)%s Log Management\n" "$ORANGE" "$RESET"
+    printf "  %s4)%s Miscellaneous\n" "$ORANGE" "$RESET"
+    printf "  %ss)%s Settings\n" "$ORANGE" "$RESET"
+    printf "  %sq)%s Quit\n\n" "$ORANGE" "$RESET"
+    printf "%s────────────────────────────────────────%s\n\n" "$GRAY" "$RESET"
+    read -r -p "Choice: " choice
+    case "$choice" in
+      1|"") apk_menu ;;
+      2)     script_config_menu ;;
+      3)     logs_menu ;;
+      4)     misc_menu ;;
+      s|S)   settings_menu ;;
+      q|Q)   echo; printf "%s%s✓ Goodbye%s\n" "$GREEN" "$BOLD" "$RESET"; return 0 ;;
+      *)     echo "Invalid."; read -r -p "Enter..." _ ;;
+    esac
+  done
+}
+
+# --------- Init (ALT screen) ---------
+ensure_self_installed
+auto_setup_termux_boot
+install_self_into_downloads
+ui_alt_on
+cleanup() {
+  if [ "${STATUS_INLINE:-0}" -eq 1 ]; then printf "\n"; STATUS_INLINE=0; fi
+  ui_show 2>/dev/null || true
+  ui_alt_off 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# --------- CLI ---------
+INTERVAL_ARG=""; REPLACE_MODE="ask"
+case "${1:-}" in
+  --monitor)
+    shift; NO_PROMPT=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --no-prompt) NO_PROMPT=1; shift ;;
+        --interval|-i) INTERVAL_ARG="${2:-}"; shift 2 ;;
+        --download-only) CYCLE_APK_ACTION="download"; shift ;;
+        --replace) REPLACE_MODE="replace"; shift ;;
+        --keep) REPLACE_MODE="keep"; shift ;;
+        *) shift ;;
+      esac
+    done
+    if [ "${NO_PROMPT:-0}" -eq 1 ]; then monitor_loop "${INTERVAL_ARG:-$MONITOR_INTERVAL_DEFAULT}" "$REPLACE_MODE"; else start_monitor_from_menu; fi
+    exit 0 ;;
+  --install-self-to-downloads)
+    install_self_into_downloads; echo "Installed self to Downloads."; exit 0 ;;
+  --force)      force_prompt_and_run; exit 0 ;;
+  --force-download|D|d) process_table_once "download"; exit 0 ;;
+  --force-di|DI|di)     process_table_once "install"; exit 0 ;;
+  --setup)      setup_reinstall; exit 0 ;;
+  --custom)     manage_custom_apks_menu; exit 0 ;;
+  --watchers)   setup_watchers_menu; exit 0 ;;
+  --check)      start_monitor_from_menu; exit 0 ;;
+  --auto-check) monitor_loop "${MONITOR_INTERVAL_DEFAULT}" "replace"; exit 0 ;;
+  --help)
+    echo "ReInstall Utility v$VERSION"
+    echo "Main storage: $MS_DIR"
+    echo "APKs dir   : $APKS_DIR"
+    echo "Usage:"
+    echo "  $0 --monitor [--interval SECONDS] [--no-prompt] [--download-only] [--replace|--keep]"
+    echo "  $0 --install-self-to-downloads   # copy this script to Downloads as reinstall.sh"
+    echo "  $0 --setup                        # select built-in APKs"
+    echo "  $0 --custom                       # manage custom GitHub Release APKs"
+    echo "  $0 --watchers                     # configure file auto-update (raw GitHub)"
+    echo "  $0 --force-download               # download all built-in + selected custom"
+    echo "  $0 --force-di                     # download+install all built-in + selected custom"
+    echo "  $0                                # menu"
+    exit 0 ;;
+esac
+
+# --------- Interactive ---------
+main_menu
