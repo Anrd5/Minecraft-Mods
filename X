@@ -802,7 +802,7 @@ if [ "\$BOOT_MODE" = "session" ] && [ "\$SESSION_MGR" = "tmux" ] && command -v t
   if ! tmux has-session -t "\$TMUX_SESSION" >/dev/null 2>&1; then
     echo "Boot: starting tmux session '\$TMUX_SESSION'" >> "\$BOOT_LOG" 2>&1
     if command -v tsu >/dev/null 2>&1 && [ "\${USE_TSU:-0}" -eq 1 ]; then
-      tmux new-session -d -s "\$TMUX_SESSION" "while :; do tsu -c \$CMD; echo 'restarting in 10s'; sleep 10; done" >>"\$BOOT_LOG" 2>&1 || true
+      tmux new-session -d -s "$TMUX_SESSION" "while :; do tsu -c "$CMD"; echo 'restarting in 10s'; sleep 10; done" >>"$LOG_OR_BOOT" 2>&1 || true
     else
       tmux new-session -d -s "\$TMUX_SESSION" "while :; do eval \$CMD; echo 'restarting in 10s'; sleep 10; done" >>"\$BOOT_LOG" 2>&1 || true
     fi
